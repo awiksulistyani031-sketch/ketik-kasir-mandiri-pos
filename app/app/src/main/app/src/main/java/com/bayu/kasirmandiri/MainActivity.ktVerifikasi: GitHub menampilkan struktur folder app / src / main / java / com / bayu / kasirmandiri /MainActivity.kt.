@@ -1,0 +1,816 @@
+package com.bayu.kasirmandiri
+
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Typeface
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.text.InputType
+import android.view.Gravity
+import android.view.View
+import android.widget.*
+import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
+import org.json.JSONObject
+import java.text.NumberFormat
+import java.text.SimpleDateFormat
+import java.util.*
+import kotlin.math.abs
+
+class MainActivity : AppCompatActivity() {
+
+    data class Produk(
+        var id: String,
+        var nama: String,
+        var modal: Long,
+        var harga: Long,
+        var stok: Int
+    )
+
+    data class ItemKeranjang(
+        val produk: Produk,
+        var qty: Int
+    )
+
+    data class Transaksi(
+        val noNota: String,
+        val tanggal: String,
+        val kasirRole: String,
+        val total: Long,
+        val laba: Long,
+        val bayar: Long,
+        val kembali: Long,
+        val ringkasanItem: String
+    )
+
+    private val prefs by lazy {
+        getSharedPreferences("kasir_mandiri_db", Context.MODE_PRIVATE)
+    }
+
+    private val adminWaNumber = "6285148360244"
+    private val bankInfo = "MANDIRI 1850004479140 a.n. Bayu Rahadian"
+
+    private val daftarProduk = mutableListOf<Produk>()
+    private val keranjang = mutableListOf<ItemKeranjang>()
+    private val daftarTransaksi = mutableListOf<Transaksi>()
+
+    private var currentRole: String = ""
+    private var activeUniqueAmount: Long = 20000L
+
+    private lateinit var rootContainer: LinearLayout
+    private lateinit var tvHeaderInfo: TextView
+    private lateinit var contentContainer: LinearLayout
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        ensureDeviceBinding()
+        ensureDefaultPasswords()
+        loadAllData()
+        requestBluetoothPermissionsIfNeeded()
+
+        buildBaseLayout()
+        refreshScreen()
+    }
+
+    private fun ensureDeviceBinding() {
+        var devId = prefs.getString("locked_device_id", null)
+        if (devId == null) {
+            val raw = "${Build.MANUFACTURER}|${Build.MODEL}|${UUID.randomUUID()}"
+            val hash = abs(raw.hashCode()).toString(16).uppercase(Locale.ROOT).padStart(8, '0')
+            devId = "HP-$hash"
+            prefs.edit().putString("locked_device_id", devId).apply()
+        }
+    }
+
+    private fun getDeviceId(): String = prefs.getString("locked_device_id", "HP-UNKNOWN") ?: "HP-UNKNOWN"
+
+    private fun getEmergencyCodeForDevice(): String {
+        val clean = getDeviceId().replace("-", "")
+        val tail = clean.takeLast(6)
+        val checksum = abs((tail + "MANDIRI20K").hashCode()) % 900 + 100
+        return "DRT-$tail-$checksum"
+    }
+
+    private fun ensureDefaultPasswords() {
+        if (!prefs.contains("pin_admin")) {
+            prefs.edit()
+                .putString("pin_admin", "1234")
+                .putString("pin_kasir", "0000")
+                .putString("nama_toko", "TOKO MANDIRI 58MM")
+                .putString("alamat_toko", "Jl. Utama No. 1")
+                .putString("printer_mac", "")
+                .putLong("active_until_ms", 0L)
+                .putLong("unique_amount", generateUniqueAmount())
+                .apply()
+        }
+    }
+
+    private fun generateUniqueAmount(): Long {
+        val code = (101..899).random()
+        return 20000L + code
+    }
+
+    private fun isLicenseActive(): Boolean {
+        val banned = prefs.getBoolean("account_banned", false)
+        if (banned) return false
+        val until = prefs.getLong("active_until_ms", 0L)
+        return System.currentTimeMillis() < until
+    }
+
+    private fun extendLicense30Days() {
+        val now = System.currentTimeMillis()
+        val currentUntil = prefs.getLong("active_until_ms", 0L)
+        val baseTime = if (currentUntil > now) currentUntil else now
+        val thirtyDaysMs = 30L * 24L * 60L * 60L * 1000L
+        prefs.edit()
+            .putLong("active_until_ms", baseTime + thirtyDaysMs)
+            .putLong("unique_amount", generateUniqueAmount())
+            .apply()
+    }
+
+    private fun loadAllData() {
+        daftarProduk.clear()
+        val prodJson = prefs.getString("data_produk", "[]") ?: "[]"
+        val prodArr = JSONArray(prodJson)
+        for (i in 0 until prodArr.length()) {
+            val obj = prodArr.getJSONObject(i)
+            daftarProduk.add(
+                Produk(
+                    id = obj.getString("id"),
+                    nama = obj.getString("nama"),
+                    modal = obj.getLong("modal"),
+                    harga = obj.getLong("harga"),
+                    stok = obj.getInt("stok")
+                )
+            )
+        }
+        if (daftarProduk.isEmpty()) {
+            daftarProduk.add(Produk("P1", "Kopi Sachet", 2000, 4000, 25))
+            daftarProduk.add(Produk("P2", "Air Mineral 600ml", 2000, 3500, 30))
+            saveProduk()
+        }
+
+        daftarTransaksi.clear()
+        val trxJson = prefs.getString("data_transaksi", "[]") ?: "[]"
+        val trxArr = JSONArray(trxJson)
+        for (i in 0 until trxArr.length()) {
+            val obj = trxArr.getJSONObject(i)
+            daftarTransaksi.add(
+                Transaksi(
+                    noNota = obj.getString("noNota"),
+                    tanggal = obj.getString("tanggal"),
+                    kasirRole = obj.getString("kasirRole"),
+                    total = obj.getLong("total"),
+                    laba = obj.getLong("laba"),
+                    bayar = obj.getLong("bayar"),
+                    kembali = obj.getLong("kembali"),
+                    ringkasanItem = obj.getString("ringkasanItem")
+                )
+            )
+        }
+        activeUniqueAmount = prefs.getLong("unique_amount", generateUniqueAmount())
+    }
+
+    private fun saveProduk() {
+        val arr = JSONArray()
+        daftarProduk.forEach { p ->
+            val obj = JSONObject()
+            obj.put("id", p.id)
+            obj.put("nama", p.nama)
+            obj.put("modal", p.modal)
+            obj.put("harga", p.harga)
+            obj.put("stok", p.stok)
+            arr.put(obj)
+        }
+        prefs.edit().putString("data_produk", arr.toString()).apply()
+    }
+
+    private fun saveTransaksi() {
+        val arr = JSONArray()
+        daftarTransaksi.forEach { t ->
+            val obj = JSONObject()
+            obj.put("noNota", t.noNota)
+            obj.put("tanggal", t.tanggal)
+            obj.put("kasirRole", t.kasirRole)
+            obj.put("total", t.total)
+            obj.put("laba", t.laba)
+            obj.put("bayar", t.bayar)
+            obj.put("kembali", t.kembali)
+            obj.put("ringkasanItem", t.ringkasanItem)
+            arr.put(obj)
+        }
+        prefs.edit().putString("data_transaksi", arr.toString()).apply()
+    }
+
+    private fun formatRp(amount: Long): String {
+        val nf = NumberFormat.getNumberInstance(Locale("id", "ID"))
+        return "Rp ${nf.format(amount)}"
+    }
+
+    private fun nowString(): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+        return sdf.format(Date())
+    }
+
+    private fun todayDateOnly(): String {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+        return sdf.format(Date())
+    }
+
+    private fun requestBluetoothPermissionsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val needed = mutableListOf<String>()
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (needed.isNotEmpty()) {
+                ActivityCompat.requestPermissions(this, needed.toTypedArray(), 101)
+            }
+        }
+    }
+
+    private fun buildBaseLayout() {
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#F4F6F8"))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT
+            )
+        }
+
+        rootContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 24, 24, 60)
+        }
+
+        tvHeaderInfo = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            setPadding(24, 20, 24, 20)
+        }
+
+        contentContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 16, 0, 0)
+        }
+
+        rootContainer.addView(tvHeaderInfo)
+        rootContainer.addView(contentContainer)
+        scroll.addView(rootContainer)
+        setContentView(scroll)
+    }
+
+    private fun refreshScreen() {
+        contentContainer.removeAllViews()
+        val toko = prefs.getString("nama_toko", "TOKO MANDIRI 58MM") ?: "TOKO MANDIRI 58MM"
+        val devId = getDeviceId()
+
+        if (prefs.getBoolean("account_banned", false)) {
+            tvHeaderInfo.text = "$toko | $devId | TERBLOKIR"
+            renderBannedScreen()
+            return
+        }
+
+        if (!isLicenseActive()) {
+            tvHeaderInfo.text = "$toko | $devId | LISENSI NONAKTIF"
+            renderActivationScreen()
+            return
+        }
+
+        if (currentRole.isEmpty()) {
+            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+            val expText = sdf.format(Date(prefs.getLong("active_until_ms", 0L)))
+            tvHeaderInfo.text = "$toko | $devId | Aktif s/d $expText"
+            renderLoginScreen()
+            return
+        }
+
+        tvHeaderInfo.text = "$toko | Peran: $currentRole | $devId"
+        if (currentRole == "ADMIN") {
+            renderAdminMenu()
+        } else {
+            renderKasirMenu()
+        }
+    }
+
+    private fun renderBannedScreen() {
+        contentContainer.addView(makeCardWarning(
+            "AKUN DINONAKTIFKAN\n\nSistem mendeteksi pengiriman bukti transfer palsu atau data yang tidak sesuai.\nHubungi Admin WA: 085148360244 untuk pemeriksaan."
+        ))
+    }
+
+    private fun renderActivationScreen() {
+        activeUniqueAmount = prefs.getLong("unique_amount", generateUniqueAmount())
+        val isFirstTime = prefs.getLong("active_until_ms", 0L) == 0L
+        val modeLabel = if (isFirstTime) "Beli & Aktivasi Awal (Rp 20.000)" else "Perpanjangan Bulanan (Rp 20.000/bulan)"
+
+        contentContainer.addView(makeTitle("Aktivasi & Langganan Aplikasi"))
+        contentContainer.addView(makeInfoBox(
+            "Skema: $modeLabel\n" +
+                "Transfer ke: $bankInfo\n" +
+                "Nominal Unik Wajib: ${formatRp(activeUniqueAmount)}\n" +
+                "ID Perangkat Terkunci: ${getDeviceId()}"
+        ))
+
+        contentContainer.addView(makeCardWarning(
+            "PERINGATAN KERAS:\nMengirim bukti transfer palsu, bukti lama, atau data yang salah akan otomatis menonaktifkan akun dan mengunci aplikasi."
+        ))
+
+        val etTanggal = EditText(this).apply {
+            hint = "Tanggal Transfer (YYYY-MM-DD), cth: ${todayDateOnly()}"
+            setText(todayDateOnly())
+        }
+        val etNominal = EditText(this).apply {
+            hint = "Nominal Transfer Terbaca (cth: $activeUniqueAmount)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(activeUniqueAmount.toString())
+        }
+        val etRef = EditText(this).apply {
+            hint = "Kode Unik / No. Referensi Bukti"
+        }
+
+        contentContainer.addView(makeLabel("Tanggal Bukti Transfer:"))
+        contentContainer.addView(etTanggal)
+        contentContainer.addView(makeLabel("Nominal Transfer (Sesuai Tagihan Unik):"))
+        contentContainer.addView(etNominal)
+        contentContainer.addView(makeLabel("Kode Unik / No. Referensi:"))
+        contentContainer.addView(etRef)
+
+        val btnVerifikasiAktifkan = Button(this).apply {
+            text = "Verifikasi Bukti & Aktifkan 30 Hari"
+            setBackgroundColor(Color.parseColor("#16A34A"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                val tgl = etTanggal.text.toString().trim()
+                val nomStr = etNominal.text.toString().trim()
+                val refCode = etRef.text.toString().trim()
+                val nom = nomStr.toLongOrNull() ?: -1L
+
+                if (tgl.length < 8 || nom <= 0 || refCode.isEmpty()) {
+                    prefs.edit().putBoolean("account_banned", true).apply()
+                    refreshScreen()
+                    return@setOnClickListener
+                }
+
+                if (nom != activeUniqueAmount || tgl != todayDateOnly()) {
+                    prefs.edit().putBoolean("account_banned", true).apply()
+                    refreshScreen()
+                    return@setOnClickListener
+                }
+
+                val usedKey = "$tgl|$nom"
+                val usedSet = prefs.getStringSet("used_proof_keys", mutableSetOf()) ?: mutableSetOf()
+                if (usedSet.contains(usedKey)) {
+                    Toast.makeText(this@MainActivity, "Bukti dengan tanggal dan nominal ini sudah pernah dipakai!", Toast.LENGTH_LONG).show()
+                    return@setOnClickListener
+                }
+
+                val updatedSet = usedSet.toMutableSet().apply { add(usedKey) }
+                prefs.edit().putStringSet("used_proof_keys", updatedSet).apply()
+                extendLicense30Days()
+                Toast.makeText(this@MainActivity, "Aktivasi berhasil! Masa aktif 30 hari berjalan.", Toast.LENGTH_LONG).show()
+                refreshScreen()
+            }
+        }
+
+        val btnKirimWa = Button(this).apply {
+            text = "Kirim Bukti ke WhatsApp Admin (085148360244)"
+            setBackgroundColor(Color.parseColor("#0284C7"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                val pesan = "Halo Admin, saya ingin konfirmasi pembayaran aplikasi kasir.\n" +
+                    "Nama Toko: ${prefs.getString("nama_toko", "-")}\n" +
+                    "ID Perangkat: ${getDeviceId()}\n" +
+                    "Nominal Unik: ${formatRp(activeUniqueAmount)}\n" +
+                    "Tanggal: ${etTanggal.text.toString().trim()}\n" +
+                    "Tujuan: $bankInfo\n" +
+                    "(Saya melampirkan foto bukti transfer pada chat ini.)"
+                val uri = Uri.parse("https://wa.me/$adminWaNumber?text=${Uri.encode(pesan)}")
+                startActivity(Intent(Intent.ACTION_VIEW, uri))
+            }
+        }
+
+        val etKodeDarurat = EditText(this).apply {
+            hint = "Masukkan Kode Darurat Admin (jika ganti HP/data hilang)"
+        }
+        val btnKodeDarurat = Button(this).apply {
+            text = "Gunakan Kode Darurat Admin"
+            setOnClickListener {
+                val inputKode = etKodeDarurat.text.toString().trim().uppercase(Locale.ROOT)
+                if (inputKode == getEmergencyCodeForDevice()) {
+                    prefs.edit().putBoolean("account_banned", false).apply()
+                    extendLicense30Days()
+                    Toast.makeText(this@MainActivity, "Kode darurat diterima. Aplikasi aktif 30 hari.", Toast.LENGTH_LONG).show()
+                    refreshScreen()
+                } else {
+                    Toast.makeText(this@MainActivity, "Kode darurat tidak valid.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        contentContainer.addView(btnVerifikasiAktifkan)
+        contentContainer.addView(btnKirimWa)
+        contentContainer.addView(makeLabel("Pemulihan Perangkat (Kode Darurat Admin):"))
+        contentContainer.addView(etKodeDarurat)
+        contentContainer.addView(btnKodeDarurat)
+    }
+
+    private fun renderLoginScreen() {
+        contentContainer.addView(makeTitle("Masuk Aplikasi Kasir"))
+        contentContainer.addView(makeInfoBox("Pilih peran dan masukkan sandi masing-masing.\nDefault Admin: 1234 | Default Kasir: 0000"))
+
+        val rgRole = RadioGroup(this).apply {
+            orientation = RadioGroup.HORIZONTAL
+        }
+        val rbKasir = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "KASIR"
+            isChecked = true
+        }
+        val rbAdmin = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "ADMIN"
+        }
+        rgRole.addView(rbKasir)
+        rgRole.addView(rbAdmin)
+
+        val etPin = EditText(this).apply {
+            hint = "Masukkan Sandi / PIN"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+        }
+
+        val btnMasuk = Button(this).apply {
+            text = "Masuk"
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                val chosenAdmin = rgRole.checkedRadioButtonId == rbAdmin.id
+                val pinInput = etPin.text.toString().trim()
+                val savedAdminPin = prefs.getString("pin_admin", "1234")
+                val savedKasirPin = prefs.getString("pin_kasir", "0000")
+
+                if (chosenAdmin && pinInput == savedAdminPin) {
+                    currentRole = "ADMIN"
+                    refreshScreen()
+                } else if (!chosenAdmin && pinInput == savedKasirPin) {
+                    currentRole = "KASIR"
+                    refreshScreen()
+                } else {
+                    Toast.makeText(this@MainActivity, "Sandi salah!", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
+        contentContainer.addView(rgRole)
+        contentContainer.addView(etPin)
+        contentContainer.addView(btnMasuk)
+    }
+
+    private fun renderKasirMenu() {
+        contentContainer.addView(makeTitle("Menu Kasir Penjualan"))
+
+        val btnLogout = Button(this).apply {
+            text = "Kunci / Ganti Akun"
+            setOnClickListener {
+                currentRole = ""
+                refreshScreen()
+            }
+        }
+        contentContainer.addView(btnLogout)
+
+        contentContainer.addView(makeLabel("Daftar Produk (Klik untuk tambah ke keranjang):"))
+        daftarProduk.forEach { produk ->
+            val btnProd = Button(this).apply {
+                text = "${produk.nama} | ${formatRp(produk.harga)} | Stok: ${produk.stok}"
+                isEnabled = produk.stok > 0
+                setOnClickListener {
+                    val existing = keranjang.find { it.produk.id == produk.id }
+                    if (existing != null) {
+                        if (existing.qty < produk.stok) existing.qty += 1
+                    } else {
+                        keranjang.add(ItemKeranjang(produk, 1))
+                    }
+                    refreshScreen()
+                }
+            }
+            contentContainer.addView(btnProd)
+        }
+
+        val totalBelanja = keranjang.sumOf { it.produk.harga * it.qty }
+        val ringkasan = if (keranjang.isEmpty()) {
+            "Keranjang kosong"
+        } else {
+            keranjang.joinToString("\n") { "${it.produk.nama} x${it.qty} = ${formatRp(it.produk.harga * it.qty)}" }
+        }
+
+        contentContainer.addView(makeInfoBox("Keranjang:\n$ringkasan\n\nTotal Tagihan: ${formatRp(totalBelanja)}"))
+
+        val etBayar = EditText(this).apply {
+            hint = "Uang Diterima (Rp)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+
+        val btnProsesBayar = Button(this).apply {
+            text = "Simpan Transaksi & Cetak Struk 58mm"
+            setBackgroundColor(Color.parseColor("#16A34A"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                if (keranjang.isEmpty()) {
+                    Toast.makeText(this@MainActivity, "Keranjang masih kosong", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                val bayar = etBayar.text.toString().trim().toLongOrNull() ?: 0L
+                if (bayar < totalBelanja) {
+                    Toast.makeText(this@MainActivity, "Uang bayar kurang dari total tagihan", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                val kembali = bayar - totalBelanja
+                var totalLaba = 0L
+                val itemLines = mutableListOf<String>()
+
+                keranjang.forEach { item ->
+                    item.produk.stok -= item.qty
+                    val labaItem = (item.produk.harga - item.produk.modal) * item.qty
+                    totalLaba += labaItem
+                    itemLines.add("${item.produk.nama} ${item.qty}x${item.produk.harga}=${item.produk.harga * item.qty}")
+                }
+
+                val noNota = "INV-${System.currentTimeMillis().toString().takeLast(6)}"
+                val trx = Transaksi(
+                    noNota = noNota,
+                    tanggal = nowString(),
+                    kasirRole = currentRole,
+                    total = totalBelanja,
+                    laba = totalLaba,
+                    bayar = bayar,
+                    kembali = kembali,
+                    ringkasanItem = itemLines.joinToString("; ")
+                )
+                daftarTransaksi.add(0, trx)
+                saveProduk()
+                saveTransaksi()
+                keranjang.clear()
+
+                val struk58 = buildReceipt58mm(trx)
+                printBluetoothText(struk58)
+                showReceiptDialog(struk58)
+                refreshScreen()
+            }
+        }
+
+        contentContainer.addView(etBayar)
+        contentContainer.addView(btnProsesBayar)
+    }
+
+    private fun renderAdminMenu() {
+        contentContainer.addView(makeTitle("Panel Admin"))
+
+        val btnKeKasir = Button(this).apply {
+            text = "Buka Layar Kasir Penjualan"
+            setBackgroundColor(Color.parseColor("#16A34A"))
+            setTextColor(Color.WHITE)
+            setOnClickListener {
+                currentRole = "KASIR"
+                refreshScreen()
+            }
+        }
+        val btnLogout = Button(this).apply {
+            text = "Keluar / Kunci"
+            setOnClickListener {
+                currentRole = ""
+                refreshScreen()
+            }
+        }
+        contentContainer.addView(btnKeKasir)
+        contentContainer.addView(btnLogout)
+
+        val totalOmzet = daftarTransaksi.sumOf { it.total }
+        val totalLaba = daftarTransaksi.sumOf { it.laba }
+        contentContainer.addView(makeInfoBox(
+            "Laporan Penjualan (Lokal HP):\n" +
+                "Jumlah Transaksi: ${daftarTransaksi.size}\n" +
+                "Total Omzet: ${formatRp(totalOmzet)}\n" +
+                "Estimasi Laba: ${formatRp(totalLaba)}"
+        ))
+
+        contentContainer.addView(makeLabel("Tambah / Perbarui Produk:"))
+        val etNama = EditText(this).apply { hint = "Nama Produk" }
+        val etModal = EditText(this).apply {
+            hint = "Harga Modal (Rp)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val etHarga = EditText(this).apply {
+            hint = "Harga Jual (Rp)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val etStok = EditText(this).apply {
+            hint = "Stok Awal"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val btnSimpanProduk = Button(this).apply {
+            text = "Simpan Produk"
+            setOnClickListener {
+                val nama = etNama.text.toString().trim()
+                val modal = etModal.text.toString().trim().toLongOrNull() ?: 0L
+                val harga = etHarga.text.toString().trim().toLongOrNull() ?: 0L
+                val stok = etStok.text.toString().trim().toIntOrNull() ?: 0
+                if (nama.isEmpty() || harga <= 0) {
+                    Toast.makeText(this@MainActivity, "Isi nama dan harga jual dengan benar", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                val existing = daftarProduk.find { it.nama.equals(nama, ignoreCase = true) }
+                if (existing != null) {
+                    existing.modal = modal
+                    existing.harga = harga
+                    existing.stok += stok
+                } else {
+                    daftarProduk.add(Produk(UUID.randomUUID().toString(), nama, modal, harga, stok))
+                }
+                saveProduk()
+                Toast.makeText(this@MainActivity, "Produk tersimpan di HP", Toast.LENGTH_SHORT).show()
+                refreshScreen()
+            }
+        }
+        contentContainer.addView(etNama)
+        contentContainer.addView(etModal)
+        contentContainer.addView(etHarga)
+        contentContainer.addView(etStok)
+        contentContainer.addView(btnSimpanProduk)
+
+        contentContainer.addView(makeLabel("Pengaturan Toko, Sandi & Printer 58mm:"))
+        val etToko = EditText(this).apply { setText(prefs.getString("nama_toko", "")) }
+        val etPinAdmin = EditText(this).apply {
+            hint = "Sandi Baru Admin"
+            setText(prefs.getString("pin_admin", "1234"))
+        }
+        val etPinKasir = EditText(this).apply {
+            hint = "Sandi Baru Kasir"
+            setText(prefs.getString("pin_kasir", "0000"))
+        }
+        val etPrinterMac = EditText(this).apply {
+            hint = "MAC Printer Bluetooth (cth: 00:11:22:33:44:55)"
+            setText(prefs.getString("printer_mac", ""))
+        }
+
+        val btnSimpanSetelan = Button(this).apply {
+            text = "Simpan Pengaturan & Sandi"
+            setOnClickListener {
+                prefs.edit()
+                    .putString("nama_toko", etToko.text.toString().trim().ifEmpty { "TOKO MANDIRI 58MM" })
+                    .putString("pin_admin", etPinAdmin.text.toString().trim().ifEmpty { "1234" })
+                    .putString("pin_kasir", etPinKasir.text.toString().trim().ifEmpty { "0000" })
+                    .putString("printer_mac", etPrinterMac.text.toString().trim())
+                    .apply()
+                Toast.makeText(this@MainActivity, "Pengaturan disimpan", Toast.LENGTH_SHORT).show()
+                refreshScreen()
+            }
+        }
+
+        contentContainer.addView(etToko)
+        contentContainer.addView(etPinAdmin)
+        contentContainer.addView(etPinKasir)
+        contentContainer.addView(etPrinterMac)
+        contentContainer.addView(btnSimpanSetelan)
+
+        val etBackup = EditText(this).apply {
+            hint = "Teks Backup / Paste Teks Restore di sini"
+            minLines = 3
+        }
+        val btnExport = Button(this).apply {
+            text = "Buat Teks Backup Data"
+            setOnClickListener {
+                val backupObj = JSONObject().apply {
+                    put("produk", prefs.getString("data_produk", "[]"))
+                    put("transaksi", prefs.getString("data_transaksi", "[]"))
+                }
+                etBackup.setText(backupObj.toString())
+                Toast.makeText(this@MainActivity, "Teks backup siap disalin", Toast.LENGTH_SHORT).show()
+            }
+        }
+        val btnImport = Button(this).apply {
+            text = "Pulihkan Data dari Teks Backup"
+            setOnClickListener {
+                try {
+                    val raw = etBackup.text.toString().trim()
+                    val obj = JSONObject(raw)
+                    prefs.edit()
+                        .putString("data_produk", obj.optString("produk", "[]"))
+                        .putString("data_transaksi", obj.optString("transaksi", "[]"))
+                        .apply()
+                    loadAllData()
+                    Toast.makeText(this@MainActivity, "Data berhasil dipulihkan", Toast.LENGTH_SHORT).show()
+                    refreshScreen()
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "Format backup tidak valid", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        contentContainer.addView(btnExport)
+        contentContainer.addView(etBackup)
+        contentContainer.addView(btnImport)
+    }
+
+    private fun buildReceipt58mm(trx: Transaksi): String {
+        val width = 32
+        val toko = (prefs.getString("nama_toko", "TOKO MANDIRI 58MM") ?: "TOKO MANDIRI 58MM").take(width)
+        val sb = StringBuilder()
+        sb.appendLine(centerLine(toko, width))
+        sb.appendLine(centerLine("STRUK PEMBAYARAN", width))
+        sb.appendLine("-".repeat(width))
+        sb.appendLine("Nota : ${trx.noNota}".take(width))
+        sb.appendLine("Tgl  : ${trx.tanggal}".take(width))
+        sb.appendLine("-".repeat(width))
+        trx.ringkasanItem.split("; ").forEach { part ->
+            sb.appendLine(part.take(width))
+        }
+        sb.appendLine("-".repeat(width))
+        sb.appendLine("TOTAL   : ${formatRp(trx.total)}".take(width))
+        sb.appendLine("BAYAR   : ${formatRp(trx.bayar)}".take(width))
+        sb.appendLine("KEMBALI : ${formatRp(trx.kembali)}".take(width))
+        sb.appendLine("-".repeat(width))
+        sb.appendLine(centerLine("Terima kasih telah belanja", width))
+        sb.appendLine("\n\n")
+        return sb.toString()
+    }
+
+    private fun centerLine(text: String, width: Int): String {
+        if (text.length >= width) return text.take(width)
+        val pad = (width - text.length) / 2
+        return " ".repeat(pad) + text
+    }
+
+    private fun printBluetoothText(receiptText: String) {
+        val mac = prefs.getString("printer_mac", "")?.trim() ?: ""
+        if (mac.isEmpty()) return
+        try {
+            val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+            val adapter: BluetoothAdapter? = btManager.adapter
+            if (adapter == null || !adapter.isEnabled) return
+            val device = adapter.getRemoteDevice(mac)
+            val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+            val socket = device.createRfcommSocketToServiceRecord(sppUuid)
+            socket.connect()
+            socket.outputStream.write(receiptText.toByteArray(Charsets.UTF_8))
+            socket.outputStream.flush()
+            socket.close()
+        } catch (_: Exception) {
+            Toast.makeText(this, "Struk tersimpan. Cek koneksi printer Bluetooth 58mm.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showReceiptDialog(receipt: String) {
+        AlertDialog.Builder(this)
+            .setTitle("Struk 58mm")
+            .setMessage(receipt)
+            .setPositiveButton("Tutup", null)
+            .show()
+    }
+
+    private fun makeTitle(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 20f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(Color.parseColor("#0F172A"))
+        setPadding(0, 8, 0, 12)
+    }
+
+    private fun makeLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(Color.parseColor("#334155"))
+        setPadding(0, 12, 0, 4)
+    }
+
+    private fun makeInfoBox(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setTextColor(Color.parseColor("#0F172A"))
+        setBackgroundColor(Color.WHITE)
+        setPadding(20, 16, 20, 16)
+    }
+
+    private fun makeCardWarning(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(Color.WHITE)
+        setBackgroundColor(Color.parseColor("#B91C1C"))
+        setPadding(20, 16, 20, 16)
+        gravity = Gravity.START
+    }
+}
