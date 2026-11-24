@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+set -e
+GRADLE_VERSION="8.4"
+GRADLE_DIR="$HOME/.gradle-wrapper-cache/gradle-${GRADLE_VERSION}"
+if [ ! -x "${GRADLE_DIR}/bin/gradle" ]; then
+  mkdir -p "${GRADLE_DIR}"
+  curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip" -o /tmp/gradle.zip
+  unzip -qo /tmp/gradle.zip -d "$HOME/.gradle-wrapper-cache"
+  chmod +x "${GRADLE_DIR}/bin/gradle"
+fi
+exec "${GRADLE_DIR}/bin/gradle" "$@"
